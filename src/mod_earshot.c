@@ -28,6 +28,7 @@
 #define EARSHOT_EVENT_SPEECH_START "earshot::speech_started"
 #define EARSHOT_EVENT_SPEECH_STOP  "earshot::speech_stopped"
 #define EARSHOT_EVENT_DTMF         "earshot::dtmf"
+#define EARSHOT_EVENT_JSON         "earshot::json"
 #define EARSHOT_EVENT_TRANSCRIPT   "earshot::transcript"
 /* mod_audio_stream dialect: fired IN ADDITION to the earshot::* events when a stream was
  * started through the uuid_audio_stream compat API, so controllers written for
@@ -57,7 +58,7 @@
 #define EARSHOT_SYNTAX \
     "<uuid> start <url> [id=<name>] [codec=l16|pcmu|pcma] [rate=8000|16000|24000] [dir=in|out|both]\n" \
     "\t  fan-out: many streams per channel via id=; dir=in is a read-only fork (transcription/monitor)\n" \
-    "\t\t[proto=native|twilio|openai|deepgram|elevenlabs|gemini|pipecat|vapi|assemblyai|cartesia]\n" \
+    "\t\t[proto=native|doubao|twilio|openai|deepgram|elevenlabs|gemini|pipecat|vapi|assemblyai|cartesia]\n" \
     "\t\t[ready=firstframe|connect|manual]\n" \
     "\t\t[vad=on [vad_barge=on] [vad_notify=on] [vad_mode=-1..3] [vad_voice_ms=200] [vad_silence_ms=500]]\n" \
     "\t\t[interruptible=none|dtmf|speech|any] [ignore_backchannel=on] [sensitivity=low|medium|high]\n" \
@@ -299,6 +300,7 @@ static void es_play_discard_locked(es_stream_t *st, int fade)
 static void es_barge_now(es_stream_t *st)
 {
     if (!st->play_buf) return;
+    es_proto_cancel(st->proto_ctx, st->ws);
     switch_mutex_lock(st->play_mutex);
     es_play_discard_locked(st, st->barge_fade_ms > 0);
     switch_mutex_unlock(st->play_mutex);
@@ -547,9 +549,12 @@ static void es_sink_json(void *user, const char *text)
 {
     es_stream_t *st = (es_stream_t *) user;
     switch_event_t *event = NULL;
-    if (!st || !st->compat_mas || !st->session || !text) return;
-    if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, MAS_EVENT_JSON) != SWITCH_STATUS_SUCCESS) return;
+    if (!st || (!st->compat_mas && st->proto != ES_PROTO_DOUBAO) || !st->session || !text) return;
+    if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM,
+        st->proto == ES_PROTO_DOUBAO ? EARSHOT_EVENT_JSON : MAS_EVENT_JSON) != SWITCH_STATUS_SUCCESS) return;
     switch_channel_event_set_data(switch_core_session_get_channel(st->session), event);
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "corr", st->corr);
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "stream-id", st->id[0] ? st->id : "default");
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "JSON", text);
     switch_event_add_body(event, "%s", text);
     switch_event_fire(&event);
@@ -842,6 +847,20 @@ static void es_sink_command(void *user, const char *action, const char *api, con
     }
 }
 
+static void es_sink_error(void *user, const char *code, int retryable)
+{
+    es_stream_t *st = (es_stream_t *)user;
+    char reason[96], safe[24]; size_t n = 0;
+    /* Error text may echo request data. Log only a bounded numeric code. */
+    while (code && code[n] >= '0' && code[n] <= '9' && n < sizeof(safe) - 1) {
+        safe[n] = code[n]; n++;
+    }
+    safe[n] = 0;
+    snprintf(reason, sizeof reason, "doubao code=%s retry=%s", n ? safe : "unknown", retryable ? "yes" : "no");
+    if (st->session) es_fire_event(st->session, EARSHOT_EVENT_ERROR, "reason", reason);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "earshot: %s\n", reason);
+}
+
 /* ---- WebSocket callbacks (run on the es_ws service thread) ------------- */
 static void es_on_ws_event(void *user, int connected, int code, const char *reason)
 {
@@ -859,6 +878,8 @@ static void es_on_ws_event(void *user, int connected, int code, const char *reas
             es_ws_send_text(st->ws, st->compat_metadata, strlen(st->compat_metadata));
         if (st->ready_mode == ES_READY_CONNECT) ES_STORE(st->ready, SWITCH_TRUE);
     } else if (st->session) {
+        es_proto_disconnected(st->proto_ctx);
+        if (st->proto == ES_PROTO_DOUBAO) es_sink_clear(st);
         /* code < 0 = connect/handshake failure, otherwise a normal close (incl. reconnect churn).
          * Safe to fire from the ws service thread: es_ws_stop mutes further callbacks and
          * es_ws_destroy waits for the service thread to go quiescent before we free st. */
@@ -898,6 +919,8 @@ static switch_bool_t es_media_bug_cb(switch_media_bug_t *bug, void *user_data, s
         if (switch_core_media_bug_read(bug, &frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS && frame.datalen) {
             /* masking window (PCI): don't leak caller audio to the agent; `pause`: nothing
              * leaves the box until `resume` (mod_audio_stream semantics) */
+            if (st->ws && es_ws_connected(st->ws))
+                es_proto_set_muted(st->proto_ctx, st->ws, ES_LOAD(st->masking) || ES_LOAD(st->paused));
             if (st->ws && es_ws_connected(st->ws) && !ES_LOAD(st->masking) && !ES_LOAD(st->paused)) {
                 /* the proto adapter frames it (native binary / twilio media JSON) */
                 es_proto_send_audio(st->proto_ctx, st->ws, (const int16_t *) frame.data, frame.datalen / 2);
@@ -927,7 +950,7 @@ static switch_bool_t es_media_bug_cb(switch_media_bug_t *bug, void *user_data, s
                                          + (switch_time_t) (st->barge_min_ms + st->vad_silence_ms) * 1000;
                         }
                     }
-                    if (st->vad_notify && st->ws) es_ws_send_text(st->ws, ES_TURN_START, strlen(ES_TURN_START));
+                    if (st->vad_notify && st->ws && st->proto != ES_PROTO_DOUBAO) es_ws_send_text(st->ws, ES_TURN_START, strlen(ES_TURN_START));
                 } else if (vs == SWITCH_VAD_STATE_STOP_TALKING && st->talking) {
                     switch_core_session_t *s = switch_core_media_bug_get_session(bug);
                     st->talking = SWITCH_FALSE;
@@ -938,7 +961,7 @@ static switch_bool_t es_media_bug_cb(switch_media_bug_t *bug, void *user_data, s
                         switch_channel_set_variable(switch_core_session_get_channel(s), "earshot_talking", "false");
                         es_fire_event(s, EARSHOT_EVENT_SPEECH_STOP, "corr", st->corr);
                     }
-                    if (st->vad_notify && st->ws) es_ws_send_text(st->ws, ES_TURN_STOP, strlen(ES_TURN_STOP));
+                    if (st->vad_notify && st->ws && st->proto != ES_PROTO_DOUBAO) es_ws_send_text(st->ws, ES_TURN_STOP, strlen(ES_TURN_STOP));
                 }
                 /* deferred speech barge: fire once the caller sustains speech past barge_min_ms
                  * (short backchannels like "yeah/okay" stop first and never trip it) */
@@ -1020,7 +1043,17 @@ static switch_bool_t es_media_bug_cb(switch_media_bug_t *bug, void *user_data, s
             es_fire_metrics(s, st);      /* final snapshot while ws stats are still available */
         }
         if (st->ws) {
-            es_proto_send_stop(st->proto_ctx, st->ws);         /* best-effort postamble */
+            es_proto_send_stop(st->proto_ctx, st->ws);
+            /* Doubao requires session.closed before TCP close. Only the call's teardown
+             * waits; the shared WebSocket loop keeps servicing every other call. */
+            if (st->proto == ES_PROTO_DOUBAO) {
+                int waits;
+                for (waits = 0; waits < 300 && es_ws_connected(st->ws) &&
+                     es_proto_close_pending(st->proto_ctx); waits++) switch_yield(10000);
+                if (es_proto_close_pending(st->proto_ctx))
+                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                        "earshot: doubao session.close acknowledgement timed out\n");
+            }
             switch_mutex_lock(st->cmd_ws_mutex);               /* fence out any in-flight command-worker echo */
             es_ws_destroy(st->ws); st->ws = NULL;              /* joins ws thread first */
             switch_mutex_unlock(st->cmd_ws_mutex);
@@ -1082,6 +1115,16 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
     {
         const char *a = switch_channel_get_variable(channel, "EARSHOT_AUTH");
         if (a && *a) switch_copy_string(st->auth, a, sizeof st->auth);
+    }
+    if (st->proto == ES_PROTO_DOUBAO) {
+        const char *key = switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY");
+        if (!key || !*key || strlen(key) > 1024 || strpbrk(key, "\r\n")) {
+            stream->write_function(stream, "-ERR valid EARSHOT_DOUBAO_API_KEY required\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        st->rate = 16000;
+        /* Native VAD notifications/DTMF are not valid Seeduplex events. */
+        st->vad_notify = SWITCH_FALSE;
     }
     /* set by the uuid_audio_stream compat shim for this start (then cleared) */
     {
@@ -1165,6 +1208,7 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
     st->sink.on_dtmf  = es_sink_dtmf;
     st->sink.on_command = es_sink_command;
     st->sink.on_transcript = es_sink_transcript;
+    st->sink.on_error = es_sink_error;
     switch_copy_string(st->uuid, switch_core_session_get_uuid(session), sizeof st->uuid);
 
     /* playback buffer for agent audio (byte-granular so WRITE_REPLACE pulls exact frames);
@@ -1179,7 +1223,8 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
         es_ws_opts_t o;
         memset(&o, 0, sizeof o);
         o.url              = st->url;
-        o.auth             = st->auth[0] ? st->auth : NULL;
+        o.auth             = st->proto != ES_PROTO_DOUBAO && st->auth[0] ? st->auth : NULL;
+        o.stop_on_http_4xx = st->proto == ES_PROTO_DOUBAO;
         o.reconnect        = switch_true(switch_channel_get_variable(channel, "EARSHOT_NO_RECONNECT")) ? 0 : 1;
         o.user             = st;
         o.on_event         = es_on_ws_event;
@@ -1204,7 +1249,8 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
             }
         }
         o.hdr_extra_name   = es_proto_extra_header_name(st->proto);   /* optional per-proto header (currently none) */
-        o.hdr_extra_value  = es_proto_extra_header_value(st->proto);
+        o.hdr_extra_value  = st->proto == ES_PROTO_DOUBAO ?
+            switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY") : es_proto_extra_header_value(st->proto);
         o.subprotocol      = es_proto_subprotocol(st->proto);         /* e.g. openai -> "realtime" */
         o.insecure         = switch_true(switch_channel_get_variable(channel, "EARSHOT_TLS_NO_HOSTNAME_CHECK"));
         st->ws = es_ws_create(&o);
@@ -1267,6 +1313,7 @@ static switch_status_t es_simple(switch_core_session_t *session, const char *ver
         ES_STORE(st->paused, SWITCH_FALSE);
         ES_STORE(st->ready, SWITCH_TRUE);   /* also opens a ready=manual gate */
     } else if (!strcasecmp(verb, "flush"))  {   /* barge-in: drop any queued agent audio now */
+        es_proto_cancel(st->proto_ctx, st->ws);
         if (st->play_buf) { switch_mutex_lock(st->play_mutex); es_play_discard_locked(st, 0); switch_mutex_unlock(st->play_mutex); }
     }
     else if (!strcasecmp(verb, "status")) {
@@ -1347,7 +1394,16 @@ static switch_status_t es_send_text_cmd(switch_core_session_t *session, const ch
     es_stream_t *st = (es_stream_t *) switch_channel_get_private(channel, es_privkey(session, id));
     if (!st || !st->ws) { stream->write_function(stream, "-ERR no active earshot stream\n"); return SWITCH_STATUS_FALSE; }
     if (zstr(text))     { stream->write_function(stream, "-ERR send needs text\n"); return SWITCH_STATUS_FALSE; }
-    es_ws_send_text(st->ws, text, strlen(text));
+    if (es_proto_send_control(st->proto_ctx, st->ws, text) != 0) {
+        stream->write_function(stream, "-ERR event invalid, reserved, or session not ready\n");
+        return SWITCH_STATUS_FALSE;
+    }
+    /* response.cancel sent through the generic API must flush just like `flush`. */
+    if (st->proto == ES_PROTO_DOUBAO) {
+        cJSON *root = cJSON_Parse(text), *type = cJSON_GetObjectItem(root, "type");
+        if (cJSON_IsString(type) && !strcmp(type->valuestring, "response.cancel")) es_sink_clear(st);
+        cJSON_Delete(root);
+    }
     stream->write_function(stream, "+OK send\n");
     return SWITCH_STATUS_SUCCESS;
 }
@@ -1542,6 +1598,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_earshot_load)
     switch_event_reserve_subclass(MAS_EVENT_DISCONNECT);
     switch_event_reserve_subclass(MAS_EVENT_ERROR);
     switch_event_reserve_subclass(EARSHOT_EVENT_TRANSCRIPT);
+    switch_event_reserve_subclass(EARSHOT_EVENT_JSON);
 
     SWITCH_ADD_API(api_interface, "earshot", "Earshot audio-stream control", earshot_api_function, EARSHOT_SYNTAX);
     SWITCH_ADD_APP(app_interface, "earshot", "Earshot audio stream", "Stream channel audio to an AI agent over WebSocket",
@@ -1620,6 +1677,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_earshot_shutdown)
     switch_event_free_subclass(MAS_EVENT_DISCONNECT);
     switch_event_free_subclass(MAS_EVENT_ERROR);
     switch_event_free_subclass(EARSHOT_EVENT_TRANSCRIPT);
+    switch_event_free_subclass(EARSHOT_EVENT_JSON);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_earshot shutdown\n");
     return SWITCH_STATUS_SUCCESS;
 }

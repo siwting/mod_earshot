@@ -25,6 +25,7 @@ typedef void (*es_ws_on_event_fn)(void *user, int connected, int code, const cha
 typedef struct {
     const char        *url;          /* ws:// or wss:// */
     const char        *auth;         /* Authorization header value, or NULL */
+    int                stop_on_http_4xx; /* permanent auth/parameter handshake error (Doubao) */
     int                reconnect;    /* 1 = auto-reconnect with backoff + jitter */
     int                max_queue_bytes; /* cap on the outbound backlog (0 = default);
                                         * drop-oldest past this so a long outage can't
@@ -73,6 +74,10 @@ int      es_ws_send_text(es_ws_t *ws, const char *data, size_t len);
 int      es_ws_send_binary(es_ws_t *ws, const void *data, size_t len);
 int      es_ws_connected(es_ws_t *ws);
 void     es_ws_get_stats(es_ws_t *ws, es_ws_stats_t *out);
+/* Drop queued frames across a session boundary; never replays stale audio. */
+void     es_ws_discard_pending(es_ws_t *ws);
+/* Nonblocking close on the service thread; retry=0 also disables reconnection. */
+void     es_ws_request_close(es_ws_t *ws, int retry);
 void     es_ws_stop(es_ws_t *ws);                   /* disconnect + detach from the pool */
 void     es_ws_destroy(es_ws_t *ws);
 

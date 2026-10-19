@@ -5,6 +5,17 @@ All notable changes to Earshot (`mod_earshot`). Format follows
 
 ## [Unreleased]
 
+### Added
+- Direct Doubao Seeduplex 3.0 adapter (`proto=doubao`): X-Api-Key authentication,
+  acknowledged session lifecycle, PCM16 16k/24k audio, cancellation, mute/unmute,
+  resumable session ID and ESL JSON/transcript/error events. See docs/DOUBAO.md.
+- Protocol regression tests and a local real-libwebsockets peer test, including
+  5xx recovery, HTTP 401 fail-stop and fragmented downlink messages.
+
+### Fixed
+- Schedule real libwebsockets housekeeping timers: timeout_ms in lws_service has
+  been ignored since 3.2, so an otherwise idle context could stall reconnect/teardown.
+
 ## [0.4.1] — 2026-10-04
 
 ### Fixed

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 struct es_proto_ctx {
     es_proto_kind_t kind;
@@ -29,12 +30,21 @@ struct es_proto_ctx {
     uint64_t        out_ts;     /* cumulative media timestamp (ms) */
     uint8_t         agg[8192];  /* assemblyai: coalesce ~20ms frames into >=50ms chunks (AAI err 3007) */
     size_t          agg_len;
+    /* Serializes Doubao media, lifecycle and control paths. Never acquire this
+     * while holding the module playback mutex. Sink callbacks only take play_mutex. */
+    pthread_mutex_t duplex_mu;
+    int duplex_state; /* 0 disconnected, 1 creating, 2 ready, 3 closing, 4 closed/failed */
+    int duplex_muted;
+    int cancel_pending;
+    char session_id[256];
+    char response_id[256], blocked_response[256];
 };
 
 /* ---- names -------------------------------------------------------------- */
 es_proto_kind_t es_proto_from_name(const char *name)
 {
     if (!name)                          return ES_PROTO_NATIVE;
+    if (!strcasecmp(name, "doubao"))    return ES_PROTO_DOUBAO;
     if (!strcasecmp(name, "twilio"))    return ES_PROTO_TWILIO;
     if (!strcasecmp(name, "openai"))    return ES_PROTO_OPENAI;
     if (!strcasecmp(name, "deepgram"))  return ES_PROTO_DEEPGRAM;
@@ -50,6 +60,7 @@ es_proto_kind_t es_proto_from_name(const char *name)
 const char *es_proto_name(es_proto_kind_t k)
 {
     switch (k) {
+    case ES_PROTO_DOUBAO:     return "doubao";
     case ES_PROTO_TWILIO:     return "twilio";
     case ES_PROTO_OPENAI:     return "openai";
     case ES_PROTO_DEEPGRAM:   return "deepgram";
@@ -68,6 +79,7 @@ es_codec_t es_proto_force_codec(es_proto_kind_t k, es_codec_t requested)
     switch (k) {
     case ES_PROTO_TWILIO:                             /* Twilio Media Streams = mu-law 8k */
         return ES_CODEC_PCMU;
+    case ES_PROTO_DOUBAO:                             /* PCM16 16k in / 24k out */
     case ES_PROTO_GEMINI:                             /* pcm 16k in / 24k out */
     case ES_PROTO_PIPECAT:                            /* raw L16 protobuf */
     case ES_PROTO_ASSEMBLYAI:                         /* Universal-Streaming: raw PCM16 (linear) */
@@ -86,7 +98,7 @@ es_codec_t es_proto_force_codec(es_proto_kind_t k, es_codec_t requested)
 
 const char *es_proto_extra_header_name(es_proto_kind_t k)
 {
-    (void) k;
+    if (k == ES_PROTO_DOUBAO) return "X-Api-Key:";
     return NULL;   /* the GA Realtime endpoint rejects the old "OpenAI-Beta: realtime=v1"
                     * header with a session error; the handshake needs only Authorization. */
 }
@@ -135,6 +147,39 @@ static void es_gen_sid(char *out, size_t olen, const char *prefix)
 
 static void es_send_text_z(es_ws_t *ws, const char *s) { es_ws_send_text(ws, s, strlen(s)); }
 
+/* Doubao Seeduplex 3.0, not the old binary S2S protocol. Input "pcm" means
+ * int16, whereas output "pcm" means float32: explicitly request pcm_s16le. */
+static const char *es_doubao_default =
+    "{\"type\":\"session.create\",\"session\":{\"model\":\"1.2.6.1\","
+    "\"audio\":{\"input\":{\"format\":{\"type\":\"pcm\",\"rate\":16000}},"
+    "\"output\":{\"format\":{\"type\":\"pcm_s16le\",\"rate\":24000},"
+    "\"voice\":\"zh_female_vv_jupiter_bigtts\"}}}}";
+
+static const char *es_string(cJSON *o, const char *key)
+{
+    cJSON *v = cJSON_GetObjectItem(o, key);
+    return cJSON_IsString(v) ? v->valuestring : "";
+}
+
+/* Fail before opening the socket if an override would make PCM bytes be decoded
+ * as Opus/float32 or at the wrong rate. Keep prompt/tools/extension verbatim. */
+static int es_doubao_config_ok(cJSON *root)
+{
+    cJSON *session = cJSON_GetObjectItem(root, "session");
+    cJSON *audio = cJSON_GetObjectItem(session, "audio");
+    cJSON *input = cJSON_GetObjectItem(audio, "input");
+    cJSON *output = cJSON_GetObjectItem(audio, "output");
+    cJSON *fi = cJSON_GetObjectItem(input, "format");
+    cJSON *fo = cJSON_GetObjectItem(output, "format");
+    cJSON *ri = cJSON_GetObjectItem(fi, "rate"), *ro = cJSON_GetObjectItem(fo, "rate");
+    return (!strcmp(es_string(root, "type"), "session.create") ||
+            !strcmp(es_string(root, "type"), "session.update")) &&
+        !strcmp(es_string(session, "model"), "1.2.6.1") &&
+        !strcmp(es_string(fi, "type"), "pcm") && cJSON_IsNumber(ri) && ri->valuedouble == 16000 &&
+        !strcmp(es_string(fo, "type"), "pcm_s16le") && cJSON_IsNumber(ro) && ro->valuedouble == 24000 &&
+        *es_string(output, "voice");
+}
+
 /* ---- lifecycle ---------------------------------------------------------- */
 es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
                                 int wire_rate, int chan_rate,
@@ -142,6 +187,7 @@ es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
 {
     es_proto_ctx_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
+    pthread_mutex_init(&p->duplex_mu, NULL);
     p->kind      = kind;
     p->codec     = codec;
     p->rate      = wire_rate > 0 ? wire_rate : 8000;
@@ -150,6 +196,17 @@ es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
     if (kind == ES_PROTO_GEMINI) { p->rate = 16000; p->rate_out = 24000; }  /* Gemini: 16k in / 24k out */
     if (kind == ES_PROTO_PIPECAT && wire_rate <= 8000) { p->rate = 16000; p->rate_out = 16000; }  /* pipecat default 16k */
     p->cfg       = (cfg && *cfg) ? strdup(cfg) : NULL;
+    if (kind == ES_PROTO_DOUBAO) {
+        cJSON *config;
+        p->codec = ES_CODEC_L16;
+        p->rate = 16000; p->rate_out = 24000;
+        if ((!cfg || !*cfg) && !p->cfg) p->cfg = strdup(es_doubao_default);
+        config = p->cfg ? cJSON_ParseWithOpts(p->cfg, NULL, 1) : NULL;
+        if (!config || !es_doubao_config_ok(config) || strcmp(es_string(config, "type"), "session.create")) {
+            cJSON_Delete(config); es_proto_destroy(p); return NULL;
+        }
+        cJSON_Delete(config);
+    }
     switch_copy_string(p->call_id, call_id ? call_id : "", sizeof p->call_id);
     switch_copy_string(p->channel_uuid, channel_uuid ? channel_uuid : "", sizeof p->channel_uuid);
     es_gen_sid(p->stream_sid,  sizeof p->stream_sid,  "MZ");
@@ -161,6 +218,10 @@ es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
         switch_resample_create(&p->rs_out, p->chan_rate, p->rate, 8192, SWITCH_RESAMPLE_QUALITY, 1);
     if (p->rate_out != p->chan_rate)
         switch_resample_create(&p->rs_in,  p->rate_out, p->chan_rate, 8192, SWITCH_RESAMPLE_QUALITY, 1);
+    if (kind == ES_PROTO_DOUBAO &&
+        ((p->rate != p->chan_rate && !p->rs_out) || (p->rate_out != p->chan_rate && !p->rs_in))) {
+        es_proto_destroy(p); return NULL;
+    }
     return p;
 }
 
@@ -176,6 +237,7 @@ void es_proto_destroy(es_proto_ctx_t *p)
     if (p->rs_out) switch_resample_destroy(&p->rs_out);
     if (p->rs_in)  switch_resample_destroy(&p->rs_in);
     free(p->cfg);
+    pthread_mutex_destroy(&p->duplex_mu);
     free(p);
 }
 
@@ -183,6 +245,29 @@ void es_proto_send_start(es_proto_ctx_t *p, es_ws_t *ws)
 {
     char msg[1200];
     if (!p || !ws) return;
+
+    if (p->kind == ES_PROTO_DOUBAO) {
+        cJSON *config, *session;
+        char *msg;
+        pthread_mutex_lock(&p->duplex_mu);
+        p->duplex_state = 1; p->agg_len = 0; p->cancel_pending = 0;
+        p->response_id[0] = p->blocked_response[0] = 0;
+        es_ws_discard_pending(ws); /* no audio from an earlier connection before session.create */
+        config = cJSON_Parse(p->cfg);
+        session = cJSON_GetObjectItem(config, "session");
+        cJSON_DeleteItemFromObject(config, "type");
+        cJSON_AddStringToObject(config, "type", "session.create");
+        if (p->session_id[0]) {
+            cJSON_DeleteItemFromObject(session, "id");
+            cJSON_AddStringToObject(session, "id", p->session_id);
+        }
+        msg = cJSON_PrintUnformatted(config);
+        if (msg) { es_send_text_z(ws, msg); free(msg); }
+        else p->duplex_state = 4;
+        cJSON_Delete(config);
+        pthread_mutex_unlock(&p->duplex_mu);
+        return;
+    }
 
     if (p->kind == ES_PROTO_TWILIO) {
         es_send_text_z(ws, "{\"event\":\"connected\",\"protocol\":\"Call\",\"version\":\"1.0.0\"}");
@@ -250,7 +335,21 @@ void es_proto_send_start(es_proto_ctx_t *p, es_ws_t *ws)
 void es_proto_send_stop(es_proto_ctx_t *p, es_ws_t *ws)
 {
     char msg[512];
-    if (!p || !ws || p->kind != ES_PROTO_TWILIO) return;
+    if (!p || !ws) return;
+    if (p->kind == ES_PROTO_DOUBAO) {
+        pthread_mutex_lock(&p->duplex_mu);
+        if (p->duplex_state == 1) {
+            /* Keep the unsent create frame. Send close when its acknowledgement arrives. */
+            p->duplex_state = 3; p->agg_len = 0;
+        } else if (p->duplex_state == 2) {
+            p->duplex_state = 3; p->agg_len = 0;
+            es_ws_discard_pending(ws);
+            es_send_text_z(ws, "{\"type\":\"session.close\"}");
+        }
+        pthread_mutex_unlock(&p->duplex_mu);
+        return;
+    }
+    if (p->kind != ES_PROTO_TWILIO) return;
     snprintf(msg, sizeof msg,
         "{\"event\":\"stop\",\"sequenceNumber\":\"%llu\",\"streamSid\":\"%s\","
         "\"stop\":{\"accountSid\":\"%s\",\"callSid\":\"%s\"}}",
@@ -271,7 +370,7 @@ void es_proto_send_mark(es_proto_ctx_t *p, es_ws_t *ws, const char *name)
 void es_proto_send_dtmf(es_proto_ctx_t *p, es_ws_t *ws, const char *digit)
 {
     char msg[256];
-    if (!p || !ws || !digit) return;
+    if (!p || !ws || !digit || p->kind == ES_PROTO_DOUBAO) return;
     if (p->kind == ES_PROTO_TWILIO)
         snprintf(msg, sizeof msg,
                  "{\"event\":\"dtmf\",\"streamSid\":\"%s\",\"dtmf\":{\"track\":\"inbound\",\"digit\":\"%s\"}}",
@@ -281,12 +380,131 @@ void es_proto_send_dtmf(es_proto_ctx_t *p, es_ws_t *ws, const char *digit)
     es_send_text_z(ws, msg);
 }
 
+void es_proto_disconnected(es_proto_ctx_t *p)
+{
+    if (!p || p->kind != ES_PROTO_DOUBAO) return;
+    pthread_mutex_lock(&p->duplex_mu);
+    p->duplex_state = 0; p->agg_len = 0; p->cancel_pending = 0;
+    if (p->ws) es_ws_discard_pending(p->ws);
+    pthread_mutex_unlock(&p->duplex_mu);
+}
+
+void es_proto_set_muted(es_proto_ctx_t *p, es_ws_t *ws, int muted)
+{
+    if (!p || p->kind != ES_PROTO_DOUBAO) return;
+    pthread_mutex_lock(&p->duplex_mu);
+    if (p->duplex_muted != !!muted) {
+        p->duplex_muted = !!muted; p->agg_len = 0;
+        if (ws && p->duplex_state == 2)
+            es_send_text_z(ws, muted ? "{\"type\":\"input_audio_mute.commit\"}" :
+                                      "{\"type\":\"input_audio_unmute.commit\"}");
+    }
+    pthread_mutex_unlock(&p->duplex_mu);
+}
+
+void es_proto_cancel(es_proto_ctx_t *p, es_ws_t *ws)
+{
+    if (!p || !ws || p->kind != ES_PROTO_DOUBAO) return;
+    pthread_mutex_lock(&p->duplex_mu);
+    if (p->duplex_state == 2 && !p->cancel_pending) {
+        p->cancel_pending = 1;
+        switch_copy_string(p->blocked_response, p->response_id, sizeof p->blocked_response);
+        es_send_text_z(ws, "{\"type\":\"response.cancel\"}");
+    }
+    pthread_mutex_unlock(&p->duplex_mu);
+}
+
+int es_proto_close_pending(es_proto_ctx_t *p)
+{
+    int pending;
+    if (!p || p->kind != ES_PROTO_DOUBAO) return 0;
+    pthread_mutex_lock(&p->duplex_mu);
+    pending = p->duplex_state == 3;
+    pthread_mutex_unlock(&p->duplex_mu);
+    return pending;
+}
+
+int es_proto_send_control(es_proto_ctx_t *p, es_ws_t *ws, const char *text)
+{
+    cJSON *root;
+    const char *type;
+    int rc = -1;
+    if (!p || !ws || !text) return -1;
+    if (p->kind != ES_PROTO_DOUBAO) return es_ws_send_text(ws, text, strlen(text));
+    root = cJSON_ParseWithOpts(text, NULL, 1);
+    if (!root) return -1;
+    type = es_string(root, "type");
+    /* Session format/lifecycle changes require a fresh start; tools and prompt can
+     * be supplied at start. Expose documented business events without an agent service. */
+    if (!strcmp(type, "response.cancel")) {
+        es_proto_cancel(p, ws); rc = 0;
+    } else if (!strcmp(type, "session.update") && es_doubao_config_ok(root)) {
+        char *cfg = cJSON_PrintUnformatted(root);
+        pthread_mutex_lock(&p->duplex_mu);
+        if (cfg && p->duplex_state == 2) {
+            rc = es_ws_send_text(ws, cfg, strlen(cfg));
+            if (!rc) { free(p->cfg); p->cfg = cfg; cfg = NULL; }
+        }
+        pthread_mutex_unlock(&p->duplex_mu);
+        free(cfg);
+    } else if (!strcmp(type, "conversation.item.create") ||
+               !strcmp(type, "conversation.item.update") ||
+               !strcmp(type, "conversation.item.retrieve") ||
+               !strcmp(type, "conversation.item.delete") ||
+               !strcmp(type, "speech_text_buffer.commit") ||
+               !strcmp(type, "speech_text_buffer.replacement.append") ||
+               !strcmp(type, "speech_text_buffer.replacement.commit") ||
+               !strcmp(type, "input_audio_buffer.commit")) {
+        pthread_mutex_lock(&p->duplex_mu);
+        if (p->duplex_state == 2) rc = es_ws_send_text(ws, text, strlen(text));
+        pthread_mutex_unlock(&p->duplex_mu);
+    }
+    cJSON_Delete(root);
+    return rc;
+}
+
+/* Accumulate exactly 20ms at 16kHz. Called only by the media thread, with the
+ * duplex mutex held; lifecycle transitions cannot race the partial packet. */
+static void es_doubao_send_audio(es_proto_ctx_t *p, es_ws_t *ws, const int16_t *pcm, size_t ns)
+{
+    while (ns) {
+        size_t take = (640 - p->agg_len) / 2;
+        if (take > ns) take = ns;
+        es_encode(ES_CODEC_L16, pcm, take, p->agg + p->agg_len);
+        p->agg_len += take * 2; pcm += take; ns -= take;
+        if (p->agg_len == 640) {
+            char b64[860], msg[960];
+            switch_b64_encode(p->agg, 640, (unsigned char *)b64, sizeof b64);
+            snprintf(msg, sizeof msg, "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}", b64);
+            es_send_text_z(ws, msg);
+            p->agg_len = 0;
+        }
+    }
+}
+
 /* ---- outbound audio (caller -> agent) ----------------------------------- */
 void es_proto_send_audio(es_proto_ctx_t *p, es_ws_t *ws, const int16_t *pcm, size_t nsamples)
 {
     uint8_t enc[SWITCH_RECOMMENDED_BUFFER_SIZE];
     size_t  nb;
     if (!p || !ws || !pcm || !nsamples) return;
+
+    if (p->kind == ES_PROTO_DOUBAO) {
+        pthread_mutex_lock(&p->duplex_mu);
+        if (p->duplex_state == 2 && !p->duplex_muted) {
+            /* Bound resampler input, but never truncate a larger captured frame. */
+            while (nsamples) {
+                size_t n = nsamples > 4096 ? 4096 : nsamples;
+                if (p->rs_out) {
+                    uint32_t count = switch_resample_process(p->rs_out, (int16_t *)pcm, (uint32_t)n);
+                    es_doubao_send_audio(p, ws, p->rs_out->to, count);
+                } else es_doubao_send_audio(p, ws, pcm, n);
+                pcm += n; nsamples -= n;
+            }
+        }
+        pthread_mutex_unlock(&p->duplex_mu);
+        return;
+    }
 
     /* channel-rate L16 -> wire-rate L16 (no-op when the rates match) */
     if (p->rs_out) {
@@ -541,6 +759,69 @@ static void es_dispatch_command(es_proto_ctx_t *p, cJSON *root, const es_proto_s
 
 #undef ES_CMD_BLOCK
 
+/* All downlink state transitions and playback delivery are serialized with
+ * local cancellation, so queued old audio cannot slip in after a flush. */
+static void es_doubao_on_text(es_proto_ctx_t *p, cJSON *root, const char *data, const es_proto_sink_t *sink)
+{
+    const char *type = es_string(root, "type");
+    const char *rid = es_string(root, "response_id");
+    int publish = strcmp(type, "response.output_audio.delta") != 0;
+    pthread_mutex_lock(&p->duplex_mu);
+    if (!strcmp(type, "session.created") && p->duplex_state == 3) {
+        if (p->ws) es_send_text_z(p->ws, "{\"type\":\"session.close\"}");
+    } else if (!strcmp(type, "session.created") && p->duplex_state == 1) {
+        cJSON *session = cJSON_GetObjectItem(root, "session");
+        switch_copy_string(p->session_id, es_string(session, "id"), sizeof p->session_id);
+        p->duplex_state = 2;
+        if (p->duplex_muted && p->ws)
+            es_send_text_z(p->ws, "{\"type\":\"input_audio_mute.commit\"}");
+    } else if (!strcmp(type, "session.closed")) {
+        p->duplex_state = 4;
+        if (p->ws) es_ws_request_close(p->ws, 0);
+    } else if (!strcmp(type, "error")) {
+        cJSON *err = cJSON_GetObjectItem(root, "error");
+        cJSON *code = cJSON_GetObjectItem(err ? err : root, "code");
+        char buf[32]; const char *value;
+        if (!code) code = cJSON_GetObjectItem(err ? err : root, "status_code");
+        snprintf(buf, sizeof buf, "%d", cJSON_IsNumber(code) ? code->valueint : 0);
+        value = cJSON_IsString(code) ? code->valuestring : buf;
+        p->duplex_state = 4;
+        if (sink->on_clear) sink->on_clear(sink->user);
+        if (sink->on_error) sink->on_error(sink->user, value, value[0] == '5');
+        if (p->ws) es_ws_request_close(p->ws, value[0] == '5');
+    } else if (p->duplex_state == 2) {
+        if (!strcmp(type, "conversation.item.input_audio_transcription.started")) {
+            switch_copy_string(p->blocked_response, p->response_id, sizeof p->blocked_response);
+            if (sink->on_clear) sink->on_clear(sink->user);
+        } else if (!strcmp(type, "response.canceled")) {
+            p->cancel_pending = 0;
+            if (sink->on_clear) sink->on_clear(sink->user);
+        } else if (!strcmp(type, "response.output_audio.started")) {
+            if (*rid) switch_copy_string(p->response_id, rid, sizeof p->response_id);
+        } else if (!strcmp(type, "response.output_audio.delta")) {
+            const char *b64 = es_string(root, "delta");
+            if (*rid && strlen(rid) < sizeof p->response_id && !p->cancel_pending &&
+                (!p->blocked_response[0] || strcmp(rid, p->blocked_response))) {
+                switch_copy_string(p->response_id, rid, sizeof p->response_id);
+                /* Reject malformed base64 and incomplete PCM samples instead of playing noise. */
+                size_t n = strlen(b64), pad = 0, i;
+                if (n && b64[n-1] == '=') pad++;
+                if (n > 1 && b64[n-2] == '=') pad++;
+                for (i = 0; i < n - pad; i++)
+                    if (!strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", b64[i])) break;
+                if (n && !(n % 4) && i == n - pad && !((n / 4 * 3 - pad) % 2))
+                    es_deliver_ulaw_b64(p, b64, ES_CODEC_L16, sink);
+            }
+        } else if (!strcmp(type, "conversation.item.input_audio_transcription.delta")) {
+            if (sink->on_transcript) sink->on_transcript(sink->user, es_string(root, "delta"), 0);
+        } else if (!strcmp(type, "conversation.item.input_audio_transcription.completed")) {
+            if (sink->on_transcript) sink->on_transcript(sink->user, es_string(root, "transcript"), 1);
+        }
+    }
+    pthread_mutex_unlock(&p->duplex_mu);
+    if (publish && sink->on_json) sink->on_json(sink->user, data);
+}
+
 void es_proto_on_text(es_proto_ctx_t *p, const char *data, size_t len, const es_proto_sink_t *sink)
 {
     cJSON *root, *ev, *node;
@@ -548,6 +829,12 @@ void es_proto_on_text(es_proto_ctx_t *p, const char *data, size_t len, const es_
     (void) len;
     if (!p || !data || !sink) return;
     if (!(root = cJSON_Parse(data))) return;
+
+    if (p->kind == ES_PROTO_DOUBAO) {
+        es_doubao_on_text(p, root, data, sink);
+        cJSON_Delete(root);
+        return; /* Never execute vendor function-call text as a FreeSWITCH command. */
+    }
 
     /* Control channel: {"type":"command",...} is honored in every protocol (earshot-specific;
      * a vendor never sends this shape, so it's a safe universal escape hatch). */
@@ -784,7 +1071,7 @@ void es_proto_on_binary(es_proto_ctx_t *p, const void *data, size_t len, const e
         return;
     }
     if (!sink->on_audio) return;
-    if (p->kind == ES_PROTO_TWILIO || p->kind == ES_PROTO_OPENAI ||
+    if (p->kind == ES_PROTO_DOUBAO || p->kind == ES_PROTO_TWILIO || p->kind == ES_PROTO_OPENAI ||
         p->kind == ES_PROTO_ELEVENLABS) return;  /* audio is text-framed */
     if (p->kind == ES_PROTO_PIPECAT) { es_pipecat_on_binary(p, (const uint8_t *) data, len, sink); return; }
     /* native + deepgram + vapi: raw codec-coded audio, any length */

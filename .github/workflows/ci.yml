@@ -15,9 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake libwebsockets-dev python3-venv
+      - name: Install local WebSocket test dependency
+        run: python3 -m venv .venv && .venv/bin/pip install websockets==15.0.1
       - name: Configure & build tests
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target test_codec test_pb test_cmdguard test_command_dispatch test_proto_audio --parallel
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEARSHOT_WS_TESTS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python" && cmake --build build --target test_codec test_pb test_cmdguard test_command_dispatch test_proto_audio test_doubao test_doubao_ws --parallel
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 

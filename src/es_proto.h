@@ -50,6 +50,7 @@ typedef enum {
     ES_PROTO_PIPECAT,      /* Pipecat protobuf frames */
     ES_PROTO_VAPI,         /* Vapi WebSocket transport (raw binary audio + JSON control) */
     ES_PROTO_ASSEMBLYAI,   /* AssemblyAI Universal-Streaming STT (audio in, transcripts out; no playback) */
+    ES_PROTO_DOUBAO,       /* Seeduplex 3.0 JSON, PCM16 16k in / 24k out */
     ES_PROTO_CARTESIA      /* Cartesia ink-whisper STT (audio in, transcripts out; no playback) */
 } es_proto_kind_t;
 
@@ -84,6 +85,7 @@ typedef struct {
      * it as the mod_audio_stream::json event that existing controllers consume. */
     void (*on_json)(void *user, const char *text);
     /* STT transcript (assemblyai): recognized text; is_final marks an end-of-turn result. May be NULL. */
+    void (*on_error)(void *user, const char *code, int retryable);
     void (*on_transcript)(void *user, const char *text, int is_final);
 } es_proto_sink_t;
 
@@ -111,6 +113,14 @@ void            es_proto_set_setvar_allow(es_proto_ctx_t *p, const char *csv);
 /* Lifecycle preamble/postamble (Twilio connected+start / stop; no-op for native). */
 void es_proto_send_start(es_proto_ctx_t *p, es_ws_t *ws);
 void es_proto_send_stop (es_proto_ctx_t *p, es_ws_t *ws);
+/* Doubao lifecycle helpers; other protocols retain their existing behavior. */
+void es_proto_disconnected(es_proto_ctx_t *p);
+void es_proto_set_muted(es_proto_ctx_t *p, es_ws_t *ws, int muted);
+void es_proto_cancel(es_proto_ctx_t *p, es_ws_t *ws);
+int  es_proto_close_pending(es_proto_ctx_t *p);
+/* Validated operator events. Doubao reserves session/audio/mute/cancel lifecycle
+ * to the adapter; other protocols pass text through unchanged. */
+int es_proto_send_control(es_proto_ctx_t *p, es_ws_t *ws, const char *text);
 
 /* Outbound caller audio (L16) -> wire (native binary / Twilio media JSON). */
 void es_proto_send_audio(es_proto_ctx_t *p, es_ws_t *ws, const int16_t *pcm, size_t nsamples);

@@ -24,6 +24,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 
 /* Upper bound on a single reassembled inbound message (runaway/hostile guard). */
 #define ES_WS_MAX_MSG (4u * 1024u * 1024u)
@@ -67,6 +68,8 @@ struct es_ws {
     volatile int            teardown;     /* stop requested by the owning thread     [p->mu] */
     _Atomic int             done;         /* service released the wsi + unlinked us (spun on) */
     volatile int            orphaned;     /* owner gave up waiting; service frees    [p->mu] */
+    _Atomic int             close_request; /* 1 close permanently, 2 reconnect */
+    _Atomic int             retry_disabled;
     int                     kill;         /* force-close the wsi (service thread only) */
     _Atomic int             suppress_events; /* mute owner callbacks once teardown starts */
     int                     backoff_ms;
@@ -99,6 +102,7 @@ typedef struct es_pool_ctx {
     pthread_mutex_t     mu;      /* guards `list` + each stream's lifecycle flags */
     es_ws_t            *list;    /* attached streams (via w->lnext) */
     es_ws_t            *arm_list;/* streams awaiting a writable arm (via w->arm_next) */
+    lws_sorted_usec_list_t housekeeping; /* real timer: lws_service timeout is ignored since 3.2 */
     long                last_walk_ms;  /* service thread only: housekeeping rate limit */
 } es_pool_ctx_t;
 
@@ -315,6 +319,10 @@ static int es_cb(struct lws *wsi, enum lws_callback_reasons reason,
          * thread in es_pool_service (outside lws_service), so w is never freed while
          * lws might still deliver a callback for this wsi. */
         if (!w) break;
+        if (reason == LWS_CALLBACK_CLIENT_CONNECTION_ERROR && w->o.stop_on_http_4xx) {
+            unsigned status = lws_http_client_http_response(wsi);
+            if (status >= 400 && status < 500) w->retry_disabled = 1;
+        }
         w->connected = 0;
         w->wsi = NULL;
         if (!w->suppress_events && w->o.on_event) {
@@ -398,18 +406,22 @@ static void es_connect(es_ws_t *w)
 }
 
 /* ---- pool service thread ----------------------------------------------- */
+static void es_housekeeping_tick(lws_sorted_usec_list_t *sul)
+{
+    es_pool_ctx_t *p = lws_container_of(sul, es_pool_ctx_t, housekeeping);
+    if (!p->running) return;
+    lws_cancel_service(p->ctx);
+    lws_sul_schedule(p->ctx, 0, &p->housekeeping, es_housekeeping_tick, 10000);
+}
+
 static void *es_pool_service(void *arg)
 {
     es_pool_ctx_t *p = (es_pool_ctx_t *) arg;
-    int gated = 0;
+    lws_sul_schedule(p->ctx, 0, &p->housekeeping, es_housekeeping_tick, 10000);
     while (p->running) {
-        /* When the previous iteration skipped the walk, an intent (a queued frame's
-         * transition wake, a stop, a start) may already be pending with its wake
-         * consumed — nothing else would wake an idle context for up to 50ms. Shorten
-         * the service timeout for exactly that window so the deferred walk runs
-         * within ~10ms instead. (Peer review: recurring ~50ms audio stall when a
-         * pong-phased wake landed in the gated window.) */
-        lws_service(p->ctx, gated ? 10 : 50);   /* woken early by lws_cancel_service */
+        /* libwebsockets >=3.2 ignores timeout_ms. A scheduled timer is required
+         * to service reconnect/teardown even with no sockets or queued audio. */
+        lws_service(p->ctx, 0);
         long now = es_now_ms();
         es_ws_t *prev = NULL, *w;
         /* Rate-limit the housekeeping walk. Under load lws_service returns per socket
@@ -417,8 +429,7 @@ static void *es_pool_service(void *arg)
          * with traffic x streams (quadratic-ish). Everything the walk does — connect,
          * teardown, ping/liveness/backoff timers, the have_queued backstop — is fine at
          * 10ms resolution, so cap it there; socket I/O itself is not delayed. */
-        if (now - p->last_walk_ms < 10) { gated = 1; continue; }
-        gated = 0;
+        if (now - p->last_walk_ms < 10) continue;
         p->last_walk_ms = now;
         pthread_mutex_lock(&p->mu);
         w = p->list;
@@ -443,6 +454,15 @@ static void *es_pool_service(void *arg)
                     w->done = 1;              /* es_ws_destroy may be waiting on this */
                     if (w->orphaned) es_free_full(w);  /* owner gave up; we own the free now */
                     w = next; continue;       /* removed from list: don't advance prev */
+                }
+            } else if (w->close_request) {
+                int request = atomic_exchange(&w->close_request, 0);
+                w->retry_disabled = request == 1;
+                es_drain(w);
+                if (w->wsi) {
+                    w->kill = 1;
+                    lws_set_timeout(w->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
+                    lws_callback_on_writable(w->wsi);
                 }
             } else if (w->want_connect) {
                 w->want_connect = 0;
@@ -474,7 +494,7 @@ static void *es_pool_service(void *arg)
                     w->kill = 1;
                     lws_callback_on_writable(w->wsi);
                 }
-            } else if (!w->connected && !w->wsi && w->o.reconnect && now >= w->next_reconnect_ms) {
+            } else if (!w->connected && !w->wsi && w->o.reconnect && !w->retry_disabled && now >= w->next_reconnect_ms) {
                 int jitter = (int) ((w->rng = w->rng * 1103515245u + 12345u) % (unsigned) (w->backoff_ms / 2 + 1));
                 w->kill = 0;   /* a liveness drop set this; clear it so the new wsi survives */
                 w->next_reconnect_ms = now + w->backoff_ms + jitter;   /* non-blocking backoff */
@@ -488,6 +508,7 @@ static void *es_pool_service(void *arg)
         }
         pthread_mutex_unlock(&p->mu);
     }
+    lws_sul_cancel(&p->housekeeping);
     return NULL;
 }
 
@@ -702,6 +723,13 @@ int es_ws_start(es_ws_t *w)
 
 int es_ws_send_text(es_ws_t *w, const char *data, size_t len)   { return w ? es_enqueue(w, data, len, 0) : -1; }
 int es_ws_send_binary(es_ws_t *w, const void *data, size_t len) { return w ? es_enqueue(w, data, len, 1) : -1; }
+void es_ws_discard_pending(es_ws_t *w) { if (w && w->pool) es_drain(w); }
+void es_ws_request_close(es_ws_t *w, int retry)
+{
+    if (!w || !w->pool) return;
+    w->close_request = retry ? 2 : 1;
+    lws_cancel_service(w->pool->ctx);
+}
 int es_ws_connected(es_ws_t *w)                                 { return w && w->connected; }
 
 void es_ws_get_stats(es_ws_t *w, es_ws_stats_t *out)

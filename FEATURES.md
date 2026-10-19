@@ -55,6 +55,7 @@ base64, and the session handshake.
 
 | `proto=` | Wire format | Barge-in signal |
 |---|---|---|
+| `doubao` | Seeduplex 3.0 JSON/base64, PCM16 16k in / 24k out | transcription.started / response.canceled |
 | `native` | raw binary frames + small JSON control (`playAudio` / `clear`) | `clear` |
 | `twilio` | Twilio Media Streams (`connected`/`start`/`media`/`mark`), base64 µ-law | `clear` |
 | `openai` | OpenAI Realtime (`session.update`, `input_audio_buffer.append`, `response.output_audio.delta`) | `speech_started` |
@@ -331,3 +332,5 @@ start wss://agent.example/… ready=connect greeting=/opt/prompts/welcome.wav
 · `earshot::speech_started` · `earshot::speech_stopped` · `earshot::transcript`
 
 See [ROADMAP.md](ROADMAP.md) for what's next.
+
+Doubao integration and validation boundaries: [DOUBAO.md](docs/DOUBAO.md).

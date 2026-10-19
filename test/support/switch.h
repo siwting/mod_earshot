@@ -5,7 +5,7 @@
  * src/es_proto.c (which includes <switch.h> and uses FreeSWITCH's cJSON) without the
  * FreeSWITCH dev headers, so the control-channel dispatch path can be tested in CI.
  *
- * It is on the include path ONLY for the test_command_dispatch target (see CMakeLists.txt),
+ * It is on the include path ONLY for the portable protocol test targets (see CMakeLists.txt),
  * never for the real module build. If es_proto.c starts using a new FreeSWITCH symbol,
  * add a matching declaration here and (if it is called on the command path) a stub
  * implementation in test/support/command_dispatch_stubs.c.
@@ -29,15 +29,7 @@ typedef unsigned long switch_size_t;
 typedef struct switch_audio_resampler { int from_rate, to_rate; int16_t *to; unsigned to_len; } switch_audio_resampler_t;
 typedef struct { unsigned char b[16]; } switch_uuid_t;
 
-typedef struct cJSON {
-    struct cJSON *next, *prev, *child;
-    int type; char *valuestring; double valuedouble; int valueint; char *string;
-} cJSON;
-cJSON *cJSON_Parse(const char *value);
-void   cJSON_Delete(cJSON *item);
-cJSON *cJSON_GetObjectItem(const cJSON *object, const char *key);
-int    cJSON_IsTrue(const cJSON *item);
-#define cJSON_ArrayForEach(e, arr) for ((e) = (arr) ? (arr)->child : 0; (e); (e) = (e)->next)
+#include "cjson/cJSON.h"
 
 size_t switch_copy_string(char *dst, const char *src, size_t n);
 void   switch_uuid_get(switch_uuid_t *u);

@@ -5,7 +5,7 @@
 # Earshot — `mod_earshot`
 
 > A FreeSWITCH module that streams live call audio to your AI agent over a WebSocket —
-> and plays the agent's voice back — full duplex, with ten ready-made protocol adapters,
+> and plays the agent's voice back — full duplex, with eleven protocol adapters,
 > module-side VAD endpointing, agent-driven call control, PCI masking, multi-stream fan-out,
 > and built-in latency metrics.
 
@@ -30,8 +30,8 @@ drop-in **`mod_audio_stream` alternative** whose `WRITE_REPLACE` path is validat
 duplex, on one leg. That's the wedge — everything else builds on it. The full pitch is in
 **[WHY.md](WHY.md)**; the complete capability list is in **[FEATURES.md](FEATURES.md)**.
 
-- **10 wire protocols, agent unmodified** — `native`, `twilio`, `openai` (Realtime),
-  `deepgram` (Voice Agent), `vapi`, `elevenlabs`, `gemini` (Live), `pipecat`, `assemblyai` + `cartesia`
+- **11 wire protocols, agent unmodified** — `native`, `twilio`, `openai` (Realtime),
+  `deepgram` (Voice Agent), `vapi`, `elevenlabs`, `gemini` (Live), `pipecat`, `assemblyai`, `cartesia` + `doubao`
   (streaming STT). Swap vendors with one word.
 - **Turn-taking for any agent** — module-side VAD endpointing → `speech_started`/`speech_stopped`, a
   ready-gate (no "answered into silence"), and speech-triggered barge-in. Off by default; leave it off
@@ -62,6 +62,7 @@ service, or — for the self-hosted Pipecat wire format — its official protobu
 
 | Agent / protocol             | `proto=`     | Status               |
 |------------------------------|--------------|----------------------|
+| Doubao Seeduplex 3.0 | `doubao` | Local protocol/WS tests passed; live validation pending — [setup](docs/DOUBAO.md) |
 | OpenAI Realtime              | `openai`     | ✅ live-validated    |
 | Deepgram Voice Agent         | `deepgram`   | ✅ live-validated    |
 | Native (any WebSocket)       | `native`     | ✅ live-validated    |
