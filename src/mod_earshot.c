@@ -15,6 +15,7 @@
  */
 
 #include <switch.h>
+#include "es_credentials.h"
 #include "es_codec.h"   /* es_codec_t + G.711/L16 (unit-tested) */
 #include "es_ws.h"      /* WebSocket transport (bounded outbound queue lives here) */
 #include "es_proto.h"   /* protocol adapters: native / twilio / ... */
@@ -218,10 +219,23 @@ static void es_fire_event(switch_core_session_t *session, const char *subclass,
     if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, subclass) != SWITCH_STATUS_SUCCESS) {
         return;
     }
-    switch_channel_event_set_data(channel, event);           /* adds Unique-ID, etc. */
+    switch_channel_event_set_data(channel, event);
+    switch_event_del_header(event, "variable_EARSHOT_DOUBAO_API_KEY");           /* adds Unique-ID, etc. */
     if (key && val) {
         switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, key, val);
     }
+    switch_event_fire(&event);
+}
+
+/* Stream events must identify a generation; late events cannot reopen a newer session. */
+static void es_fire_stream_event(es_stream_t *st, const char *subclass, const char *key, const char *val)
+{
+    switch_event_t *event = NULL;
+    if (!st || !st->session || switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, subclass) != SWITCH_STATUS_SUCCESS) return;
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", switch_core_session_get_uuid(st->session));
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "stream-id", st->id[0] ? st->id : "default");
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "corr", st->corr);
+    if (key && val) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, key, val);
     switch_event_fire(&event);
 }
 
@@ -239,6 +253,7 @@ static void es_fire_metrics(switch_core_session_t *session, es_stream_t *st)
     if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, EARSHOT_EVENT_METRICS) != SWITCH_STATUS_SUCCESS)
         return;
     switch_channel_event_set_data(channel, event);
+    switch_event_del_header(event, "variable_EARSHOT_DOUBAO_API_KEY");
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "corr", st->corr);
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "stream-id", st->id[0] ? st->id : "default");
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "proto", es_proto_name(st->proto));
@@ -553,6 +568,7 @@ static void es_sink_json(void *user, const char *text)
     if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM,
         st->proto == ES_PROTO_DOUBAO ? EARSHOT_EVENT_JSON : MAS_EVENT_JSON) != SWITCH_STATUS_SUCCESS) return;
     switch_channel_event_set_data(switch_core_session_get_channel(st->session), event);
+    switch_event_del_header(event, "variable_EARSHOT_DOUBAO_API_KEY");
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "corr", st->corr);
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "stream-id", st->id[0] ? st->id : "default");
     switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "JSON", text);
@@ -857,7 +873,7 @@ static void es_sink_error(void *user, const char *code, int retryable)
     }
     safe[n] = 0;
     snprintf(reason, sizeof reason, "doubao code=%s retry=%s", n ? safe : "unknown", retryable ? "yes" : "no");
-    if (st->session) es_fire_event(st->session, EARSHOT_EVENT_ERROR, "reason", reason);
+    if (st->session) es_fire_stream_event(st, EARSHOT_EVENT_ERROR, "reason", reason);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "earshot: %s\n", reason);
 }
 
@@ -883,7 +899,7 @@ static void es_on_ws_event(void *user, int connected, int code, const char *reas
         /* code < 0 = connect/handshake failure, otherwise a normal close (incl. reconnect churn).
          * Safe to fire from the ws service thread: es_ws_stop mutes further callbacks and
          * es_ws_destroy waits for the service thread to go quiescent before we free st. */
-        es_fire_event(st->session, code < 0 ? EARSHOT_EVENT_ERROR : EARSHOT_EVENT_DISCONNECTED,
+        es_fire_stream_event(st, code < 0 ? EARSHOT_EVENT_ERROR : EARSHOT_EVENT_DISCONNECTED,
                       "reason", reason ? reason : "");
         if (st->compat_mas)
             es_fire_event(st->session, code < 0 ? MAS_EVENT_ERROR : MAS_EVENT_DISCONNECT,
@@ -978,7 +994,7 @@ static switch_bool_t es_media_bug_cb(switch_media_bug_t *bug, void *user_data, s
             es_greeting_emit(st);   /* covers the agent-still-silent case; no-op if already emitted */
             if (s) {
                 switch_channel_set_variable(switch_core_session_get_channel(s), "earshot_ready", "true");
-                es_fire_event(s, EARSHOT_EVENT_READY, "corr", st->corr);
+                es_fire_stream_event(st, EARSHOT_EVENT_READY, "corr", st->corr);
             }
         }
         /* periodic metrics (metrics=<seconds> option) */
@@ -1117,11 +1133,6 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
         if (a && *a) switch_copy_string(st->auth, a, sizeof st->auth);
     }
     if (st->proto == ES_PROTO_DOUBAO) {
-        const char *key = switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY");
-        if (!key || !*key || strlen(key) > 1024 || strpbrk(key, "\r\n")) {
-            stream->write_function(stream, "-ERR valid EARSHOT_DOUBAO_API_KEY required\n");
-            return SWITCH_STATUS_FALSE;
-        }
         st->rate = 16000;
         /* Native VAD notifications/DTMF are not valid Seeduplex events. */
         st->vad_notify = SWITCH_FALSE;
@@ -1248,12 +1259,29 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
                 o.hdr_meta = ms;
             }
         }
+        char doubao_key[ES_SECRET_MAX + 1] = {0};
+        if (st->proto == ES_PROTO_DOUBAO) {
+            const char *file = switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY_FILE");
+            const char *legacy = switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY");
+            int valid = file && *file ? es_secret_read(doubao_key, file) : es_secret_copy(doubao_key, legacy);
+            switch_channel_set_variable(channel, "EARSHOT_DOUBAO_API_KEY", NULL);
+            switch_channel_set_variable(channel, "EARSHOT_DOUBAO_API_KEY_FILE", NULL);
+            if (valid != 0) {
+                es_secret_wipe(doubao_key, sizeof(doubao_key));
+                es_proto_destroy(st->proto_ctx); st->proto_ctx = NULL;
+                if (st->vad) switch_vad_destroy(&st->vad);
+                if (st->play_buf) switch_buffer_destroy(&st->play_buf);
+                stream->write_function(stream, "-ERR valid Doubao credential required\n");
+                return SWITCH_STATUS_FALSE;
+            }
+        }
         o.hdr_extra_name   = es_proto_extra_header_name(st->proto);   /* optional per-proto header (currently none) */
         o.hdr_extra_value  = st->proto == ES_PROTO_DOUBAO ?
-            switch_channel_get_variable(channel, "EARSHOT_DOUBAO_API_KEY") : es_proto_extra_header_value(st->proto);
+            doubao_key : es_proto_extra_header_value(st->proto);
         o.subprotocol      = es_proto_subprotocol(st->proto);         /* e.g. openai -> "realtime" */
         o.insecure         = switch_true(switch_channel_get_variable(channel, "EARSHOT_TLS_NO_HOSTNAME_CHECK"));
         st->ws = es_ws_create(&o);
+        es_secret_wipe(doubao_key, sizeof(doubao_key));
         if (st->ws) es_proto_set_ws(st->proto_ctx, st->ws);   /* enable receive-path pong (elevenlabs) */
         if (!st->ws || es_ws_start(st->ws) != 0) {
             stream->write_function(stream, "-ERR could not open websocket to %s\n", st->url);
@@ -1289,7 +1317,7 @@ static switch_status_t es_start(switch_core_session_t *session, int argc, char *
     switch_channel_set_private(channel, es_privkey(session, st->id), st);
     /* register the caller-DTMF hook once per channel — on the default (unnamed) stream */
     if (!st->id[0]) { st->owns_dtmf_hook = SWITCH_TRUE; switch_core_event_hook_add_recv_dtmf(session, es_dtmf_hook); }
-    es_fire_event(session, EARSHOT_EVENT_CONNECTED, "url", st->url);
+    es_fire_stream_event(st, EARSHOT_EVENT_CONNECTED, "url", st->url);
     stream->write_function(stream, "+OK stream '%s' started\n", st->id[0] ? st->id : "default");
     return SWITCH_STATUS_SUCCESS;
 }
@@ -1318,10 +1346,10 @@ static switch_status_t es_simple(switch_core_session_t *session, const char *ver
     }
     else if (!strcasecmp(verb, "status")) {
         stream->write_function(stream,
-            "{\"id\":\"%s\",\"proto\":\"%s\",\"corr\":\"%s\",\"ws_connected\":%d,\"ready\":%d,\"paused\":%d,"
+            "{\"id\":\"%s\",\"proto\":\"%s\",\"corr\":\"%s\",\"ws_connected\":%d,\"session_ready\":%d,\"ready\":%d,\"paused\":%d,"
             "\"rx_frames\":%llu,\"play_buffered\":%u}\n",
             st->id[0] ? st->id : "default", es_proto_name(st->proto), st->corr,
-            st->ws ? es_ws_connected(st->ws) : 0, ES_LOAD(st->ready), ES_LOAD(st->paused),
+            st->ws ? es_ws_connected(st->ws) : 0, es_proto_session_ready(st->proto_ctx), ES_LOAD(st->ready), ES_LOAD(st->paused),
             (unsigned long long) st->rx_frames,
             st->play_buf ? (unsigned) switch_buffer_inuse(st->play_buf) : 0);
         return SWITCH_STATUS_SUCCESS;
@@ -1489,6 +1517,7 @@ SWITCH_STANDARD_API(earshot_api_function)
 
     if (!strcasecmp(argv[1], "start")) {
         status = es_start(target, argc, argv, stream);          /* start reads id= from options */
+        switch_channel_set_variable(switch_core_session_get_channel(target), "EARSHOT_DOUBAO_API_KEY", NULL);
     } else {                                                    /* other verbs: optional id= after the verb */
         const char *id = "";
         int t = 2;
@@ -1520,6 +1549,7 @@ SWITCH_STANDARD_APP(earshot_app_function)
     argc = es_split_argv(full, argv);
     if (argc >= 2 && !strcasecmp(argv[1], "start")) {
         es_start(session, argc, argv, &stream);
+        switch_channel_set_variable(switch_core_session_get_channel(session), "EARSHOT_DOUBAO_API_KEY", NULL);
     } else if (argc >= 2) {
         const char *id = "";
         int d = 1;                                              /* tokens in `data` before free text */

@@ -16,6 +16,7 @@
  * Copyright (c) 2026 Varun Pratap Singh. MIT License.
  */
 #include "es_ws.h"
+#include "es_credentials.h"
 
 #include <libwebsockets.h>
 #include <pthread.h>
@@ -182,12 +183,14 @@ static void es_free_full(es_ws_t *w)
     free(w->rx);
     if (w->pool) pthread_mutex_destroy(&w->mu);   /* mu is only initialised once started */
     free((void *) w->o.url);
+    if (w->o.auth) es_secret_wipe((void *)w->o.auth, strlen(w->o.auth));
     free((void *) w->o.auth);
     free((void *) w->o.hdr_call_id);
     free((void *) w->o.hdr_channel_uuid);
     free((void *) w->o.hdr_correlation);
     free((void *) w->o.hdr_meta);
     free((void *) w->o.hdr_extra_name);
+    if (w->o.hdr_extra_value) es_secret_wipe((void *)w->o.hdr_extra_value, strlen(w->o.hdr_extra_value));
     free((void *) w->o.hdr_extra_value);
     free((void *) w->o.subprotocol);
     free(w);

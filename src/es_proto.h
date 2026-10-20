@@ -97,6 +97,8 @@ typedef struct es_proto_ctx es_proto_ctx_t;
  * call_id / channel_uuid populate the Twilio `start` metadata (and correlation).
  * cfg (may be NULL) is a verbatim session-config JSON sent as the first message for
  * openai/deepgram (overrides the built-in audio-format default). */
+int es_proto_session_ready(es_proto_ctx_t *p);
+
 es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
                                 int wire_rate, int chan_rate,
                                 const char *call_id, const char *channel_uuid, const char *cfg);

@@ -48,6 +48,7 @@ int main(void) {
     CHECK(!strcmp(es_proto_extra_header_name(ES_PROTO_DOUBAO),"X-Api-Key:"));
     CHECK(es_proto_subprotocol(ES_PROTO_DOUBAO)==NULL);
     es_proto_ctx_t *p=create(8000); CHECK(p); if(!p)return 1; es_proto_set_ws(p,ws);
+    CHECK(!es_proto_session_ready(p));
     es_proto_send_audio(p,ws,pcm,160); CHECK(test_ws_sends==0);
     es_proto_send_start(p,ws); CHECK(sent_type("session.create")); CHECK(test_ws_discards==1);
     cJSON *cfg=sent(), *session=cJSON_GetObjectItem(cfg,"session"), *a=cJSON_GetObjectItem(session,"audio");
@@ -58,7 +59,7 @@ int main(void) {
     char *saved=cJSON_PrintUnformatted(cfg);cJSON_Delete(cfg);
     es_proto_send_audio(p,ws,pcm,160); CHECK(test_ws_sends==1); /* wait for ack */
     delta(p,"pre-ack",480);CHECK(samples==0);
-    ready(p); es_proto_send_audio(p,ws,pcm,160);CHECK(sent_type("input_audio_buffer.append"));
+    ready(p); CHECK(es_proto_session_ready(p)); es_proto_send_audio(p,ws,pcm,160);CHECK(sent_type("input_audio_buffer.append"));
     cfg=sent();const char *b64=cJSON_GetObjectItem(cfg,"audio")->valuestring;
     char bytes[641];CHECK(switch_b64_decode((char *)b64,bytes,sizeof bytes)==640);
     CHECK((unsigned char)bytes[0]==0x34&&(unsigned char)bytes[1]==0x12);cJSON_Delete(cfg);
@@ -89,7 +90,7 @@ int main(void) {
     CHECK(es_proto_send_control(p,ws,"not JSON")==-1);
     char *update=strdup(saved);char *t=strstr(update,"session.create");memcpy(t,"session.update",14);
     CHECK(es_proto_send_control(p,ws,update)==0); CHECK(sent_type("session.update"));free(update);
-    es_proto_disconnected(p);n=test_ws_sends;es_proto_send_audio(p,ws,pcm,160);CHECK(test_ws_sends==n);
+    es_proto_disconnected(p);CHECK(!es_proto_session_ready(p));n=test_ws_sends;es_proto_send_audio(p,ws,pcm,160);CHECK(test_ws_sends==n);
     es_proto_send_start(p,ws);CHECK(sent_type("session.create"));
     cfg=sent();session=cJSON_GetObjectItem(cfg,"session");CHECK(!strcmp(cJSON_GetObjectItem(session,"id")->valuestring,"dialog-test"));cJSON_Delete(cfg);
     ready(p);old=samples;

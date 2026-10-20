@@ -27,6 +27,9 @@ set(EARSHOT_CORE_SOURCES src/es_codec.c src/es_pb.c src/es_cmdguard.c)
 if(EARSHOT_TESTS)
   enable_testing()
 
+  add_executable(test_credentials test/test_credentials.c)
+  add_test(NAME credentials COMMAND test_credentials)
+
   add_executable(test_codec test/test_codec.c src/es_codec.c)
   add_test(NAME codec COMMAND test_codec)
 

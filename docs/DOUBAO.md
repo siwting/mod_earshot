@@ -18,7 +18,7 @@
 
 ## 最小接入
 
-先由现有配置或业务控制器给该通道设置 `EARSHOT_DOUBAO_API_KEY`。不要将真实密钥提交到代码库。随后在已接听的通话上执行：
+正式接入推荐设置 `EARSHOT_DOUBAO_API_KEY_FILE=/etc/callcenter/doubao-api-key`，由 FreeSWITCH 本机读取密钥，避免密钥进入 ESL 命令及通道事件。文件必须为普通文件（非符号链接），不可允许组/其他用户写入或其他用户读取；推荐 root:callcenter 0640，确保 FS 用户可读。仅支持一行 1–1024 字节可见 ASCII 密钥，允许结尾换行。文件读取失败不会回退。兼容旧的 `EARSHOT_DOUBAO_API_KEY` 输入，模块读取后立即清除，启动失败也清除；正式环境不要使用这个旧方式。传输层凭证副本用于重连，释放时擦除。随后在已接听的通话上执行：
 
 ```text
 earshot <uuid> start wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue proto=doubao
@@ -71,15 +71,15 @@ earshot <uuid> stop
 
 ## 部署集成
 
-`deployment-modular` 和 `deployment-cluster` 都锁定上述最新上游提交，下载源码后应用包内 `lib/engine/patches/mod_earshot-doubao.patch`。上游源码、补丁均校验 SHA256。补丁变化会生成独立源码目录并使构建记录失效；原源码目录保留。补丁错误立即终止，不产生已验证标记。
+`deployment-modular` 和 `deployment-cluster` 使用 fork `siwting/mod_earshot` 的 `main`，以各部署包 `sources.lock.json` 中的提交和 SHA256 为准，校验源码后直接构建，无需本地豆包补丁。voiceswitch 文件凭证接入要求模块包含文件凭证、事件关联和会话状态查询改动；旧的 `a631b95` 不满足要求。
 
 已有服务器应先在测试环境构建验证，再排空通话并使用对应部署包的 `03-freeswitch.sh --apply-config` 更新。该入口可能按构建记录重建 FreeSWITCH，不能当作仅热加载一个模块的命令。安装路径继续从 `pkg-config --variable=modulesdir freeswitch` 获取。`--check` 仅验证服务和模块加载，不代表豆包实呼验收。
 
-本次未改现网、未添加实际 DID 路由、未更新现有发布压缩包、未推送远程仓库。回退应恢复升级前的部署包及匹配模块，在排空通话后按原流程重新安装。
+源码发布和部署包更新不代表已部署到现网，也不自动添加实际 DID 路由。回退应恢复升级前的部署包及匹配模块，在排空通话后按原流程重新安装。
 
 ## 验证与边界
 
-本地通过 6 组 C 单元/协议测试和 1 组真实 libwebsockets 本地对端测试（正常收发、分片重组、5xx 重连和 HTTP 401 停止重试）；AddressSanitizer / UndefinedBehaviorSanitizer 同样通过。测试使用真实 cJSON 和协议适配器，FreeSWITCH 重采样器由测试替身验证采样率方向与样本数量，不验证音质。
+本地通过 7 组 C 单元/协议测试和 1 组真实 libwebsockets 本地对端测试（正常收发、分片重组、5xx 重连和 HTTP 401 停止重试）；AddressSanitizer / UndefinedBehaviorSanitizer 同样通过。测试使用真实 cJSON 和协议适配器，FreeSWITCH 重采样器由测试替身验证采样率方向与样本数量，不验证音质。
 
 本地缺少 FreeSWITCH 开发环境，尚未完成 Debian 原生 `.so` 构建、加载、真实豆包凭证握手及电话端到端音质/时延验收。需要在测试服务器确认通话不回灌 AI 播放音频、真实插话打断、挂断释放和连续会话表现。
 
@@ -98,3 +98,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 官方依据（2026-10-19 核对）：[API 文档](https://docs.volcengine.com/docs/DoubaoVoice/endtoend-realtime-voice-full-duplex-version?lang=zh)、[接入必读](https://docs.volcengine.com/docs/DoubaoVoice/access-mustread?lang=zh)、API 页面提供的 `python3.7_duplex_demo.zip`。
+
+## 后端状态对接补充
+
+`earshot <uuid> status id=agent` 的 `session_ready` 表示豆包会话是否已经确认；`ready` 只是媒体播放门控，不能替代会话确认。错误/断连/ready/connected 事件带 `stream-id` 和 `corr`，后端可按每次启动的独立 corr 排除旧事件。

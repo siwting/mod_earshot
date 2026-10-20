@@ -181,6 +181,17 @@ static int es_doubao_config_ok(cJSON *root)
 }
 
 /* ---- lifecycle ---------------------------------------------------------- */
+int es_proto_session_ready(es_proto_ctx_t *p)
+{
+    int ready;
+    if (!p) return 0;
+    if (p->kind != ES_PROTO_DOUBAO) return 1;
+    pthread_mutex_lock(&p->duplex_mu);
+    ready = p->duplex_state == 2;
+    pthread_mutex_unlock(&p->duplex_mu);
+    return ready;
+}
+
 es_proto_ctx_t *es_proto_create(es_proto_kind_t kind, es_codec_t codec,
                                 int wire_rate, int chan_rate,
                                 const char *call_id, const char *channel_uuid, const char *cfg)
